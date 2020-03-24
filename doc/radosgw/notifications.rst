@@ -256,7 +256,7 @@ pushed or pulled using the pubsub sync module.
 
    {"Records":[  
        {
-           "eventVersion":"2.1"
+           "eventVersion":"2.1",
            "eventSource":"aws:s3",
            "awsRegion":"",
            "eventTime":"",
@@ -280,7 +280,7 @@ pushed or pulled using the pubsub sync module.
                        "principalId":""
                    },
                    "arn":"",
-                   "id:""
+                   "id":""
                },
                "object":{
                    "key":"",
@@ -293,7 +293,7 @@ pushed or pulled using the pubsub sync module.
                }
            },
            "eventId":"",
-           "opaqueData":"",
+           "opaqueData":""
        }
    ]}
 
