@@ -18,8 +18,8 @@ namespace rgw::amqp_1 {
 	typedef boost::intrusive_ptr<connection_t> connection_ptr_t;
 
 
-	void instrusive_ptr_add_ref(const connection_t* p);
-	void instrusive_ptr_release(const connection_t* p);
+	void intrusive_ptr_add_ref(const connection_t* p);
+	void intrusive_ptr_release(const connection_t* p);
 
 	typedef std::function<void(int)> reply_callback_t;
 
