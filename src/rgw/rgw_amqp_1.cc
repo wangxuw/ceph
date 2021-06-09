@@ -3,22 +3,39 @@
 
 #include "rgw_amqp_1.h"
 #include "common/dout.h"
+#include "include/ceph_assert.h"
 
+#include <boost/optional/optional.hpp>
+#include <boost/lockfree/queue.hpp>
+
+#include <proton/error_condition.hpp>
 #include <proton/messaging_handler.hpp>
+#include <proton/message.hpp>
+#include <proton/container.hpp>
 #include <proton/connection.hpp>
 #include <proton/connection_options.hpp>
-#include <proton/fwd.hpp>
+#include <proton/source_options.hpp>
 #include <proton/sender.hpp>
-#include <boost/lockfree/queue.hpp>
+#include <proton/work_queue.hpp>
+#include <proton/tracker.hpp>
+#include <proton/delivery.hpp>
 #include <vector>
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
 #include <unordered_map>
 #include <thread>
-#define dout_sys ceph_subsys_rgw
+
+#define dout_subsys ceph_subsys_rgw
 
 namespace rgw::amqp_1 {
+
+static const int RGW_AMQP_1_STATUS_CONNECTION_CLOSED = -0x1002;
+static const int RGW_AMQP_1_STATUS_QUEUE_FULL = -0x1003;
+static const int RGW_AMQP_1_STATUS_MAX_INFLIGHT = -0x1004;
+static const int RGW_AMQP_1_STATUS_MANAGER_STOPPED = -0x1005;
+
+static const int RGW_AMQP_1_STATUS_OK = 0x0;
 
 	struct reply_callback_with_tag_t {
 		uint64_t tag;
@@ -33,36 +50,88 @@ namespace rgw::amqp_1 {
 
 	typedef std::vector<reply_callback_with_tag_t> CallbackList;
 
-	struct connection_t {
-		bool marked_for_deletion;
+	struct connection_t : public proton::messaging_handler{
+		bool marked_for_deletion = false;
+		uint64_t delivery_tag = 1;
+		int status;
 		mutable std::atomic<int> ref_count = 0;
 		CephContext* const cct;
 		CallbackList callbacks;
-		private:
-		class proton_handler_t : public proton::messaging_handler {
-			public:
-			proton_handler_t(proton::container& _cont, const std::string& _url);
+		std::string broker;
+		proton::sender sender;
+		// proton::connection_options options;
+		proton::work_queue* pwork_queue;
+		int queued;
+		std::mutex lock;
+		std::condition_variable sender_ready;
 
-			private:
-			std::string conn_url;
-			proton::sender sender;
-
-			proton::work_queue* work_queue;
-			std::mutex wq_lock;
-			std::condition_variable sender_ready;
-
-			public:
-			// TODO:
-
-		};
+		const boost::optional<std::string> ca_location;
 
 		public:
-		int for_unittest() { return 200; }
+		// void send(const proton::message& m);
+
+		private:
+		proton::work_queue* work_queue() {
+			std::unique_lock<std::mutex> lk(lock);
+			while(!pwork_queue) sender_ready.wait(lk);
+			return pwork_queue;
+		}
+
+		void on_sender_open(proton::sender& s) override {
+			std::lock_guard<std::mutex> lk(lock);
+			sender = s;
+			pwork_queue = &s.work_queue();
+		}
+
+		void on_sendable(proton::sender& s) override {
+			std::lock_guard<std::mutex> lk(lock);
+			sender_ready.notify_all();
+		}
+
+		void do_send(const proton::message& m) {
+			sender.send(m);
+			std::lock_guard<std::mutex> lk(lock);
+			--queued;
+			sender_ready.notify_all();
+		}
+
+		// void on_tracker_accept(proton::tracker& t) override;
+
+		// void on_error(const proton::error_condition& e) override;
+
+		void close() {
+			pwork_queue->add([=]() { sender.connection().close(); });
+		}
+
+		public:
+
+		// default ctor
+		connection_t(CephContext* _cct, const	std::string& _broker, const
+				boost::optional<const std::string&> _ca_location) : 
+			cct(_cct), broker(_broker), ca_location(_ca_location), pwork_queue(0) { }
+
+		~connection_t() {
+			destroy(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
+		}
 
 		// TODO
-		void destroy(int s);
-		// TODO
-		bool is_ok() const;
+		void destroy(int s) {
+			status = s;
+			close();
+
+			// fire all remaining callbacks
+			std::for_each(callbacks.begin(), callbacks.end(), [this](auto& cb_tag) {
+				cb_tag.cb(status);
+				ldout(cct, 20) << "AMQP1.0 destroy: invoking callback with tag=" << cb_tag.tag << dendl;
+			});
+			callbacks.clear();
+			delivery_tag = 1;
+		}
+
+		// sender.active() or sender.uninitialized()
+		bool is_ok() const {
+			return (!sender.active() && !marked_for_deletion);
+		}
 
 		friend void instrusive_ptr_add_ref(const connection_t* p);
 		friend void instrusive_ptr_release(const connection_t* p);
@@ -81,10 +150,32 @@ namespace rgw::amqp_1 {
 	}
 
 	// TODO
-	connection_ptr_t& create_connection(connection_ptr_t& conn);
+	connection_ptr_t& create_connection(proton::container& container, connection_ptr_t& conn) {
+		// pointer must be valid and not marked for deletion
+		ceph_assert(conn && !conn->marked_for_deletion);
+
+		// reset all status code
+		conn->status = RGW_AMQP_1_STATUS_OK;
+
+		// TODO: ssl config
+
+		// TODO: detail error control and error code handling
+		container.open_sender(conn->broker,
+				proton::connection_options().handler(*conn));
+		return conn;
+		
+	}
 
 	// TODO: utility function to create a new connection
-	connection_ptr_t create_new_connection(const std::string& info);
+	connection_ptr_t create_new_connection(proton::container& container, const std::string& broker, CephContext*
+			cct, boost::optional<const std::string&> ca_location) {
+		// create connection state
+		connection_ptr_t conn = new connection_t(cct, broker, ca_location);
+		// conn->broker = broker;
+		// conn->cct = cct;
+		// conn->ca_location = ca_location;
+		return create_connection(container, conn);
+	}
 
 	struct message_wrapper_t {
 		connection_ptr_t conn;
@@ -123,15 +214,70 @@ namespace rgw::amqp_1 {
 			// const ceph::coarse_real_clock::duration reconnect_time;
 			std::thread runner;
 
+			proton::container container;
+			std::thread container_runner;
+
+			// meeting: to restrict container runner running before the runner
+			void run_container() {
+				container.run();
+			}
+
 			// TODO
-			void publish_internal(message_wrapper_t* message);
+			void publish_internal(message_wrapper_t* message) {
+				const std::unique_ptr<message_wrapper_t> msg_owner(message);
+				auto& conn = message->conn;
 
-			void run() noexcept;
+				if(!conn->is_ok()) {
+					ldout(conn->cct, 1) << "AMQP_1 publish: connection had an issue while"
+					"message was in the queue" << dendl;
+					if(message->cb) {
+						message->cb(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
+					}
+					return;
+				}
 
-			static void delete_message(const message_wrapper_t* message);
+				// message without a callback
+				if(message->cb == nullptr) {
+					// TODO
+				}
+
+				// message with a callback
+			}
+
+			void run() noexcept {
+			}
+
+			// TODO
+			static void delete_message(const message_wrapper_t* message) {
+				delete message;
+			}
 
 		public:
-			Manager();
+			Manager(size_t _max_connections,
+					size_t _max_inflight,
+					size_t _max_queue, 
+					CephContext* _cct) : 
+				max_connections(_max_connections),
+				max_inflight(_max_inflight),
+				max_queue(_max_queue),
+				connection_count(0),
+				stopped(false),
+				connections(_max_connections),
+				messages(max_queue),
+				queued(0),
+				dequeued(0),
+				cct(_cct),
+				runner(&Manager::run, this),
+				container_runner(&Manager::run_container, this) {
+					// The hashmap has "max connections" as the initial number of buckets, 
+					// and allows for 10 collisions per bucket before rehash.
+					// This is to prevent rehashing so that iterators are not invalidated 
+					// when a new connection is added.
+					connections.max_load_factor(10.0);
+					// give the runner thread a name for easier debugging
+					const auto rc = ceph_pthread_setname(runner.native_handle(), "amqp_1_manager");
+					ceph_assert(rc==0);
+				}
 
 			// non copyable
 			Manager(const Manager&) = delete;
@@ -152,15 +298,65 @@ namespace rgw::amqp_1 {
 			}
 
 			// TODO with params
-			connection_ptr_t connect(const std::string& info);
+			connection_ptr_t connect(const std::string& url, bool use_ssl,
+			boost::optional<const std::string&> ca_location) {
+				if(stopped) {
+					ldout(cct, 1) << "AMQP_1 connect: manager is stopped" << dendl;
+					return nullptr;
+				}
+				// TODO: check url format parse
+				// TODO: max connections check
+				std::lock_guard<std::mutex> lock(connections_lock);
+
+				// TODO: find in the stale connectionlists
+
+				const auto conn = create_new_connection(container, url, cct, ca_location);
+
+				ceph_assert(conn);
+				++connection_count;
+				ldout(cct, 10) << "AMQP_1 connect: new connection is created. Total"
+					"connections: " << connection_count << dendl;
+				return connections.emplace(url, conn).first->second;
+			}
 
 			int publish(connection_ptr_t& conn, const std::string& topic, const
-					std::string& message);
+					std::string& message) {
+				if(stopped) {
+					return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
+				}
+				if(!conn || !conn->is_ok()) {
+					return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
+				}
+				if(messages.push(new message_wrapper_t(conn, topic, message, nullptr)))
+					{
+						++queued;
+						return RGW_AMQP_1_STATUS_OK;
+					}
+				return RGW_AMQP_1_STATUS_QUEUE_FULL;
+			}
 
 			int publish_with_confirm(connection_ptr_t& conn, const std::string& topic,
-					const std::string& message, reply_callback_t cb);
+					const std::string& message, reply_callback_t cb) {
+				if(stopped) {
+					return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
+				}
+				if(!conn || !conn->is_ok()) {
+					return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
+				}
+				if(messages.push(new message_wrapper_t(conn, topic, message, cb)))
+					{
+						++queued;
+						return RGW_AMQP_1_STATUS_OK;
+					}
+				return RGW_AMQP_1_STATUS_QUEUE_FULL;
+			}
 
-			~Manager();
+			~Manager() {
+				stopped = true;
+				runner.join();
+				container_runner.join();
+				messages.consume_all(delete_message);
+			}
 
 			// get the number of connections
 			size_t get_connection_count() const {
@@ -203,7 +399,7 @@ namespace rgw::amqp_1 {
 			return false;
 		}
 		// TODO: take conf from CephContext
-		s_manager = new Manager(MAX_CONNECTIONS_DEFAULT, MAX_INFLIGHT_DEFAULT, MAX_QUEUE_DEFAULT, READ_TIMEOUT_MS_DEFAULT, cct);
+		s_manager = new Manager(MAX_CONNECTIONS_DEFAULT, MAX_INFLIGHT_DEFAULT, MAX_QUEUE_DEFAULT, cct);
 		return true;
 	}
 
@@ -212,16 +408,16 @@ namespace rgw::amqp_1 {
 		s_manager = nullptr;
 	}
 
-	connection_ptr_t connect(const std::string& url, bool use_ssl, bool verify_ssl,
+	connection_ptr_t connect(const std::string& url, bool use_ssl,
 			boost::optional<const std::string&> ca_location) {
 		if (!s_manager) return nullptr;
-		return s_manager->connect(url, use_ssl, verify_ssl, ca_location);
+		return s_manager->connect(url, use_ssl, ca_location);
 	}
 
 	int publish(connection_ptr_t& conn, 
 			const std::string& topic,
 			const std::string& message) {
-		if (!s_manager) return STATUS_MANAGER_STOPPED;
+		if (!s_manager) return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
 		return s_manager->publish(conn, topic, message);
 	}
 
@@ -229,7 +425,7 @@ namespace rgw::amqp_1 {
 			const std::string& topic,
 			const std::string& message,
 			reply_callback_t cb) {
-		if (!s_manager) return STATUS_MANAGER_STOPPED;
+		if (!s_manager) return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
 		return s_manager->publish_with_confirm(conn, topic, message, cb);
 	}
 
