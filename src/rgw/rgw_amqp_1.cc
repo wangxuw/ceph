@@ -8,6 +8,7 @@
 #include <boost/optional/optional.hpp>
 #include <boost/lockfree/queue.hpp>
 
+#include <chrono>
 #include <proton/error_condition.hpp>
 #include <proton/messaging_handler.hpp>
 #include <proton/message.hpp>
@@ -25,6 +26,8 @@
 #include <atomic>
 #include <unordered_map>
 #include <thread>
+// TODO: for debug
+#include <iostream>
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -68,7 +71,14 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 		const boost::optional<std::string> ca_location;
 
 		public:
-		// void send(const proton::message& m);
+		void send(const proton::message& m) {
+			{
+				std::unique_lock<std::mutex> lk(lock);
+				while(!pwork_queue) sender_ready.wait(lk);
+				++queued;
+			}
+			pwork_queue->add([=]() { this->do_send(m); });
+		}
 
 		private:
 		proton::work_queue* work_queue() {
@@ -81,6 +91,7 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 			std::lock_guard<std::mutex> lk(lock);
 			sender = s;
 			pwork_queue = &s.work_queue();
+			std::cout << "conn sender opened" << std::endl;
 		}
 
 		void on_sendable(proton::sender& s) override {
@@ -88,8 +99,9 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 			sender_ready.notify_all();
 		}
 
+		// TODO: meeting proton::sender::send() returns a tracker
 		void do_send(const proton::message& m) {
-			sender.send(m);
+			auto t = sender.send(m);
 			std::lock_guard<std::mutex> lk(lock);
 			--queued;
 			sender_ready.notify_all();
@@ -209,17 +221,17 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 			std::atomic<size_t> dequeued;
 			CephContext* const cct;
 			mutable std::mutex connections_lock;
+			// const ceph::coarse_real_clock::duration idle_time;
+			proton::container container;
+			std::thread container_runner;
 			// TODO is there two to reserve?
 			// const ceph::coarse_real_clock::duration idle_time;
 			// const ceph::coarse_real_clock::duration reconnect_time;
 			std::thread runner;
 
-			proton::container container;
-			std::thread container_runner;
-
-			// meeting: to restrict container runner running before the runner
 			void run_container() {
-				container.run();
+				// TODO: proton::container::run(int) could create a thread poll
+				container.run(3);
 			}
 
 			// TODO
@@ -239,12 +251,21 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 				// message without a callback
 				if(message->cb == nullptr) {
 					// TODO
+					conn->send(proton::message(message->message));
 				}
 
 				// message with a callback
 			}
 
 			void run() noexcept {
+				while(!stopped) {
+					const auto count = messages.consume_all(std::bind(&Manager::publish_internal, this, std::placeholders::_1));
+					const unsigned idle_time = 3;
+					auto incoming_message = false;
+					if (count == 0 && !incoming_message) {
+						std::this_thread::sleep_for(std::chrono::milliseconds(idle_time));
+					}
+				}
 			}
 
 			// TODO
@@ -275,8 +296,12 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 					// when a new connection is added.
 					connections.max_load_factor(10.0);
 					// give the runner thread a name for easier debugging
-					const auto rc = ceph_pthread_setname(runner.native_handle(), "amqp_1_manager");
+					const auto rc = ceph_pthread_setname(runner.native_handle(),
+							"amqp_1_runner");
 					ceph_assert(rc==0);
+					const auto rcc = ceph_pthread_setname(container_runner.native_handle(), "prtn_container");
+					// TODO: meeting assert failure
+					ceph_assert(rcc==0);
 				}
 
 			// non copyable
@@ -353,9 +378,10 @@ static const int RGW_AMQP_1_STATUS_OK = 0x0;
 
 			~Manager() {
 				stopped = true;
+				container.stop();
 				runner.join();
 				container_runner.join();
-				messages.consume_all(delete_message);
+				// messages.consume_all(delete_message);
 			}
 
 			// get the number of connections
