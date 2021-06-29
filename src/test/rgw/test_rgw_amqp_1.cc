@@ -1,7 +1,6 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
 // vim: ts=8 sw=2 smarttab
 
-// TODO: add the details of running this test
 #include "rgw/rgw_amqp_1.h"
 #include "common/ceph_context.h"
 #include <chrono>
@@ -30,7 +29,7 @@ class TestAMQP_1 : public ::testing::Test {
 
 	void TearDown() override {
 		// we have to make sure that we delete Manager after connections are closed.
-		std::this_thread::sleep_for(std::chrono::milliseconds(10));
+		// std::this_thread::sleep_for(std::chrono::milliseconds(10));
 		rgw::amqp_1::shutdown();
 	}
 };
