@@ -60,7 +60,7 @@ TEST_F(TestAMQP_1, PublishOK) {
 	const std::string test_broker = "localhost:5672/amqp1_0";
 	auto conn = rgw::amqp_1::connect(test_broker, false, boost::none);
 	EXPECT_TRUE(conn);
-	auto rc = rgw::amqp_1::publish(conn, "amqp1_0", "sample-message");
+	auto rc = rgw::amqp_1::publish(conn, "amqp1_0", "new-sample-message");
 	EXPECT_EQ(rc, 0);
 }
 

@@ -27,7 +27,6 @@
 #include <atomic>
 #include <unordered_map>
 #include <thread>
-// TODO: for debug
 #include <iostream>
 
 #define dout_subsys ceph_subsys_rgw
@@ -54,19 +53,10 @@ namespace rgw::amqp_1 {
 	int status_tracker_to_rgw(int s) {
 		if(s == AMQP_1_TRACKER_STATUS_ACCEPTED) {
 			return RGW_AMQP_1_STATUS_OK;
+		} else {
+			return s;
 		}
 	}
-
-	struct reply_callback_with_tag_t {
-		uint64_t tag;
-		reply_callback_t cb;
-
-		reply_callback_with_tag_t(uint64_t _tag, reply_callback_t _cb) : tag(_tag), cb(_cb) {}
-
-		bool operator==(uint64_t rhs) {
-			return tag == rhs;
-		}
-	};
 
 	struct reply_callback_with_tracker_t {
 		proton::tracker tracker;
@@ -81,8 +71,22 @@ namespace rgw::amqp_1 {
 		}
 	};
 
-	typedef std::vector<reply_callback_with_tag_t> CallbackList;
-	typedef std::vector<reply_callback_with_tracker_t> CallbackList_tracker;
+	struct message_wrapper_t {
+		connection_ptr_t conn;
+		std::string topic;
+		std::string message;
+		reply_callback_t cb;
+
+		message_wrapper_t(connection_ptr_t& _conn,
+				const std::string& _topic,
+				const std::string& _message,
+				reply_callback_t _cb) : conn(_conn), topic(_topic), message(_message), cb(_cb) { }
+	};
+
+
+	typedef std::unordered_map<std::string, connection_ptr_t> ConnectionList;
+	typedef boost::lockfree::queue<message_wrapper_t*, boost::lockfree::fixed_sized<true>> MessageQueue;
+	typedef std::vector<reply_callback_with_tracker_t> CallbackList;
 
 	// proton::tracker states to string
 	std::string to_string(enum proton::transfer::state s) {
@@ -119,8 +123,9 @@ namespace rgw::amqp_1 {
 		}
 	}
 
-	struct connection_t : public proton::messaging_handler{
+	class connection_t : public proton::messaging_handler{
 		friend class Manager;
+		public:
 		// proton::connection proton_conn;
 		bool marked_for_deletion = false;
 		// to count how many message been sent in total
@@ -128,40 +133,27 @@ namespace rgw::amqp_1 {
 		int status;
 		mutable std::atomic<int> ref_count = 0;
 		CephContext* const cct;
+		MessageQueue messages;
 		// TODO: amqp1.0 tag?
-		CallbackList_tracker callbacks;
+		CallbackList callbacks;
 		std::string broker;
 		proton::sender sender;
 		// proton::connection_options options;
-		proton::work_queue* pwork_queue;
+		// proton::work_queue* pwork_queue;
 		int queued;
-		std::mutex lock;
-		std::condition_variable sender_ready;
+		// std::mutex lock;
+		// std::condition_variable sender_ready;
 
 		const boost::optional<std::string> ca_location;
 
 		public:
-		// public interface to send a message to a broker
-		// meetin, we here register the callbacks
-		void send(const proton::message& m, reply_callback_t cb) {
-			{
-				std::unique_lock<std::mutex> lk(lock);
-				while(!pwork_queue) sender_ready.wait(lk);
-				++queued;
-			}
-			pwork_queue->add([=]() { this->do_send(m, cb); });
-		}
-
-		private:
-		// initiate the work_queue when the sender is ready
-		proton::work_queue* work_queue() {
-			std::unique_lock<std::mutex> lk(lock);
-			while(!pwork_queue) sender_ready.wait(lk);
-			return pwork_queue;
-		}
 
 		void on_connection_open(proton::connection& conn) {
 			std::cout << "proton::connection on_connection_open" <<std::endl;
+		}
+
+		void on_connection_close(proton::connection& conn) {
+			std::cout << "proton::connection on_connection_CLOSE" <<std::endl;
 		}
 
 		void on_connection_error(proton::connection& conn) {
@@ -170,9 +162,9 @@ namespace rgw::amqp_1 {
 
 		// assign the work_queue of the sender
 		void on_sender_open(proton::sender& s) override {
-			std::lock_guard<std::mutex> lk(lock);
+			// std::lock_guard<std::mutex> lk(lock);
 			sender = s;
-			pwork_queue = &s.work_queue();
+			// pwork_queue = &s.work_queue();
 			std::cout << "conn sender opened success" << std::endl;
 		}
 
@@ -182,21 +174,23 @@ namespace rgw::amqp_1 {
 		}
 
 		void on_sendable(proton::sender& s) override {
-			std::lock_guard<std::mutex> lk(lock);
-			sender_ready.notify_all();
+			// std::lock_guard<std::mutex> lk(lock);
+			// sender_ready.notify_all();
+			auto count = messages.consume_all(std::bind(&connection_t::send, this,
+						std::placeholders::_1));
+			queued -= count;
 		}
 
-		// TODO: meeting proton::sender::send() returns a tracker
 		// send a message, and keep record the tracker for later callbacks
-		void do_send(const proton::message& m, reply_callback_t cb) {
+		void send(message_wrapper_t* message) {
 			// t is the tracker of this message
+			proton::message m(message->message);
 			auto t = sender.send(m);
-			std::lock_guard<std::mutex> lk(lock);
-			--queued;
-			if(cb != nullptr) {
-				callbacks.emplace_back(t, cb);
+			// std::lock_guard<std::mutex> lk(lock);
+			if(message->cb != nullptr) {
+				callbacks.emplace_back(t, message->cb);
 			}
-			sender_ready.notify_all();
+			// sender_ready.notify_all();
 		}
 
 		// common callback for different tracker states
@@ -234,7 +228,8 @@ namespace rgw::amqp_1 {
 
 		// close the connection of the sender
 		void close() {
-			pwork_queue->add([=]() { sender.connection().close(); });
+			std::cout << " sender connection closing" << std::endl;
+			sender.connection().close(); 
 		}
 
 		public:
@@ -242,7 +237,7 @@ namespace rgw::amqp_1 {
 		// default ctor
 		connection_t(CephContext* _cct, const	std::string& _broker, const
 				boost::optional<const std::string&> _ca_location) : 
-			cct(_cct), broker(_broker), ca_location(_ca_location), pwork_queue(0) { }
+			cct(_cct), broker(_broker), messages(1024), ca_location(_ca_location) { }
 
 		~connection_t() {
 			destroy(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
@@ -311,23 +306,6 @@ namespace rgw::amqp_1 {
 		return create_connection(container, conn);
 	}
 
-	struct message_wrapper_t {
-		connection_ptr_t conn;
-		std::string topic;
-		std::string message;
-		// proton::tracker tracker;
-		reply_callback_t cb;
-
-		message_wrapper_t(connection_ptr_t& _conn,
-				const std::string& _topic,
-				const std::string& _message,
-				reply_callback_t _cb) : conn(_conn), topic(_topic), message(_message), cb(_cb) { }
-	};
-
-
-	typedef std::unordered_map<std::string, connection_ptr_t> ConnectionList;
-	typedef boost::lockfree::queue<message_wrapper_t*, boost::lockfree::fixed_sized<true>> MessageQueue;
-
 
 	class Manager {
 		public:
@@ -339,7 +317,7 @@ namespace rgw::amqp_1 {
 			bool stopped;
 			struct timeval read_timeout;
 			ConnectionList connections;
-			MessageQueue messages;
+			// MessageQueue messages;
 			std::atomic<size_t> queued;
 			std::atomic<size_t> dequeued;
 			CephContext* const cct;
@@ -360,39 +338,12 @@ namespace rgw::amqp_1 {
 				container.run();
 			}
 
-			// publish the message and fire the failed publish's callback
-			// cases of failure:
-			// 1. connection closed;
-			// 2.
-			void publish_internal(message_wrapper_t* message) {
-				const std::unique_ptr<message_wrapper_t> msg_owner(message);
-				auto& conn = message->conn;
+			// publish_internal() is for runner thread which used to handle amqp and
+			// kafka publishing, now in amqp 1.0 with the qpid proton library, we
+			// directly use the library-provided proton::container::run() thread, thus
+			// we don't need publish_internal() here.
 
-				if(!conn->is_ok()) {
-					ldout(conn->cct, 1) << "AMQP_1 publish: connection had an issue while"
-						"message was in the queue" << dendl;
-					if(message->cb) {
-						message->cb(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
-					}
-					return;
-				}
 
-				// message without a callback
-				if(message->cb == nullptr) {
-					conn->send(proton::message(message->message), nullptr);
-				} else {
-					// message with callback
-					const auto q_len = conn->callbacks.size();
-					if(q_len < max_inflight) {
-						ldout(conn->cct, 20) << "callbacks queue added one callback." << dendl;
-						// conn->callbacks.emplace_back(conn->delivery_tag++, message->cb);
-						// we use tracker to associate the message and callbacks now
-						conn->send(proton::message(message->message),message->cb);
-					}
-				}
-			}
-
-			// TODO
 			static void delete_message(const message_wrapper_t* message) {
 				delete message;
 			}
@@ -408,11 +359,10 @@ namespace rgw::amqp_1 {
 				connection_count(0),
 				stopped(false),
 				connections(_max_connections),
-				messages(max_queue),
+				// messages(max_queue),
 				queued(0),
 				dequeued(0),
 				cct(_cct),
-				// runner(&Manager::run, this),
 				// container_runner(&Manager::run_container, this) {
 				container_runner([&]() { container.run(); }) {
 					// The hashmap has "max connections" as the initial number of buckets, 
@@ -436,14 +386,7 @@ namespace rgw::amqp_1 {
 				stopped = true;
 			}
 
-			// disconnect from a broker
-			bool disconnect(connection_ptr_t& conn) {
-				if (!conn || stopped) {
-					return false;
-				}
-				conn->marked_for_deletion = true;
-				return true;
-			}
+			// disconnect() is removed.
 
 			// TODO with params
 			connection_ptr_t connect(const std::string& url, bool use_ssl,
@@ -475,13 +418,12 @@ namespace rgw::amqp_1 {
 				if(!conn || !conn->is_ok()) {
 					return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
 				}
-				// if(messages.push(new message_wrapper_t(conn, topic, message, nullptr)))
-				// 	{
-				// 		++queued;
-				// 		return RGW_AMQP_1_STATUS_OK;
-				// 	}
-				publish_internal(new message_wrapper_t(conn, topic, message, nullptr));
-				// return RGW_AMQP_1_STATUS_QUEUE_FULL;
+				if(conn->messages.push(new message_wrapper_t(conn, topic, message, nullptr)))
+					{
+						++queued;
+						return RGW_AMQP_1_STATUS_OK;
+					}
+				return RGW_AMQP_1_STATUS_QUEUE_FULL;
 			}
 
 			int publish_with_confirm(connection_ptr_t& conn, const std::string& topic,
@@ -492,13 +434,12 @@ namespace rgw::amqp_1 {
 				if(!conn || !conn->is_ok()) {
 					return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
 				}
-				publish_internal(new message_wrapper_t(conn, topic, message, cb));
-				// if(messages.push(new message_wrapper_t(conn, topic, message, cb)))
-				// 	{
-				// 		++queued;
-				// 		return RGW_AMQP_1_STATUS_OK;
-				// 	}
-				// return RGW_AMQP_1_STATUS_QUEUE_FULL;
+				if(conn->messages.push(new message_wrapper_t(conn, topic, message, cb)))
+					{
+						++queued;
+						return RGW_AMQP_1_STATUS_OK;
+					}
+				return RGW_AMQP_1_STATUS_QUEUE_FULL;
 			}
 
 			// we have to close all active connection when delete Manager
@@ -510,12 +451,13 @@ namespace rgw::amqp_1 {
 			}
 
 			~Manager() {
-				messages.consume_all(delete_message);
+				// messages.consume_all(delete_message);
 				// if there's no connection, proton::container::run() will never stop
 				if(connections.empty()) {
 					container.stop();
 				} else {
 					connection_clean();
+					container.stop();
 				}
 				container_runner.join();
 			}
@@ -626,9 +568,6 @@ namespace rgw::amqp_1 {
 		return s_manager->max_queue;
 	}
 
-	bool disconnect(connection_ptr_t& conn) {
-		if (!s_manager) return false;
-		return s_manager->disconnect(conn);
-	}
+	// disconnect() is removed.
 
 	} // namespace amqp_1
