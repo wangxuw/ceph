@@ -10,8 +10,9 @@
 
 /*
 
- how-to running the test
-
+1. first build the amqp 1.0 broker, then run locally specifying a [address:port/topic]
+	e.g.  # ${BROKER_BINARY} -a localhost:5672/amqp1_0
+2. build this unit test and run it.
 */
 
 
@@ -73,17 +74,17 @@ TEST_F(TestAMQP_1, PublishWithCallback) {
 	EXPECT_EQ(test_ok, true);
 }
 
-TEST_F(TestAMQP_1, InvalidHost) {
-	const std::string invalid_broker = "27.1.1.2:5673/amqp1_0";
-	const auto connection_number = rgw::amqp_1::get_connection_count();
-	auto conn = rgw::amqp_1::connect(invalid_broker, false, boost::none);
-	EXPECT_TRUE(conn);
-	const auto connection_number_plus = rgw::amqp_1::get_connection_count();
-	EXPECT_EQ(connection_number_plus, connection_number + 1);
-	auto rc = rgw::amqp_1::publish(conn, "amqp1_0", "sample-message");
-	EXPECT_LT(rc, 0);
-}
-
+// TEST_F(TestAMQP_1, InvalidHost) {
+// 	const std::string invalid_broker = "27.1.1.2:5673/amqp1_0";
+// 	const auto connection_number = rgw::amqp_1::get_connection_count();
+// 	auto conn = rgw::amqp_1::connect(invalid_broker, false, boost::none);
+// 	EXPECT_TRUE(conn);
+// 	const auto connection_number_plus = rgw::amqp_1::get_connection_count();
+// 	EXPECT_EQ(connection_number_plus, connection_number + 1);
+// 	auto rc = rgw::amqp_1::publish(conn, "amqp1_0", "sample-message");
+// 	EXPECT_LT(rc, 0);
+// }
+// 
 // TEST_F(TestAMQP_1, InvalidPort) {
 // 	const std::string broker_invalid_port = "localhost:5673/amqp1_0";
 // 	auto conn = rgw::amqp_1::connect(broker_invalid_port, false, boost::none);

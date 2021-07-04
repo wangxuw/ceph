@@ -296,7 +296,7 @@ namespace rgw::amqp_1 {
 			bool stopped;
 			ConnectionList connections;
 			std::atomic<size_t> queued;
-			// std::atomic<size_t> dequeued;
+			std::atomic<size_t> dequeued;
 			CephContext* const cct;
 			mutable std::mutex connections_lock;
 			proton::container container;
