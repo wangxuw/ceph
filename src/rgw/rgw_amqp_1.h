@@ -62,8 +62,7 @@ namespace rgw::amqp_1 {
 	// maximum number of messages in the queue
 	size_t get_max_queue();
 
-	// disconnect from a kafka broker
-	bool disconnect(connection_ptr_t& conn);
+	// disconnect() is removed
 
 	// display connection as string
 	std::string to_string(const connection_ptr_t& conn);

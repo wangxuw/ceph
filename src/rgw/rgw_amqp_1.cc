@@ -8,26 +8,20 @@
 #include <boost/optional/optional.hpp>
 #include <boost/lockfree/queue.hpp>
 
-#include <chrono>
-#include <proton/error_condition.hpp>
 #include <proton/messaging_handler.hpp>
 #include <proton/message.hpp>
 #include <proton/container.hpp>
 #include <proton/connection.hpp>
 #include <proton/connection_options.hpp>
-#include <proton/source_options.hpp>
 #include <proton/sender.hpp>
-#include <proton/transfer.hpp>
 #include <proton/work_queue.hpp>
 #include <proton/tracker.hpp>
-#include <proton/delivery.hpp>
+
 #include <vector>
 #include <mutex>
-#include <condition_variable>
 #include <atomic>
 #include <unordered_map>
 #include <thread>
-#include <iostream>
 
 #define dout_subsys ceph_subsys_rgw
 
@@ -103,6 +97,7 @@ namespace rgw::amqp_1 {
 			case proton::transfer::state::MODIFIED:
 				return "AMQP_1_TRACKER_STATUS_MODIFIED";
 		}
+		return "";
 	}
 
 	int reply_to_code(enum proton::transfer::state s) {
@@ -120,6 +115,7 @@ namespace rgw::amqp_1 {
 			case proton::transfer::state::MODIFIED:
 				return AMQP_1_TRACKER_STATUS_MODIFIED;
 		}
+		return AMQP_1_TRACKER_STATUS_UNKOWN;
 	}
 
 	class connection_t : public proton::messaging_handler{
@@ -146,15 +142,15 @@ namespace rgw::amqp_1 {
 
 		void on_connection_open(proton::connection& conn) {
 			connection = conn;
-			std::cout << "proton::connection on_connection_open" <<std::endl;
+			ldout(cct, 10) << "AMQP 1.0 proton: connnection opened." << dendl;
 		}
 
 		void on_connection_close(proton::connection& conn) {
-			std::cout << "proton::connection on_connection_CLOSE" <<std::endl;
+			ldout(cct, 10) << "AMQP 1.0 proton: connection closed." << dendl;
 		}
 
 		void on_connection_error(proton::connection& conn) {
-			std::cout << "proton::connection on_connection_ERROR " <<std::endl;
+			ldout(cct, 1) << "AMQP 1.0 proton: connection error:" << conn.error().what() << dendl;
 		}
 
 		// assign the work_queue of the sender
@@ -162,12 +158,10 @@ namespace rgw::amqp_1 {
 			sender = s;
 			pwork_queue = &s.work_queue();
 			ready = true;
-			std::cout << "conn sender opened success" << std::endl;
 		}
 
 		void on_sender_error(proton::sender& s) override {
 			status = RGW_AMQP_1_STATUS_SENDER_ERROR;
-			std::cout << "SENDER ERROR" <<std::endl;
 		}
 
 		void on_sendable(proton::sender& s) override {
@@ -182,6 +176,7 @@ namespace rgw::amqp_1 {
 			pwork_queue->add([=]() {
 					proton::message m(message->message);
 					auto t = sender.send(m);
+					delivery_tag++;
 					if(message->cb != nullptr) {
 					callbacks.emplace_back(t, message->cb);
 					}
@@ -201,7 +196,7 @@ namespace rgw::amqp_1 {
 				it->cb(status_tracker_to_rgw(rc));
 			} else {
 				// callback not found
-				ldout(cct, 20) << "AMQP1.0 tracker of unknown callback." << dendl;
+				ldout(cct, 1) << "AMQP1.0 tracker of unknown callback." << dendl;
 			}
 		}
 
@@ -218,14 +213,11 @@ namespace rgw::amqp_1 {
 		}
 
 		void on_error(const proton::error_condition& e) override {
-			std::cout << "error: " << e << std::endl;
 		}
 
-		// close the connection of the sender, called by external thread(rgw)
+		// close the connection of the sender, called by the external thread (rgw)
 		void close() {
 			pwork_queue->add([=]() { connection.close(); });
-			std::cout << " sender connection closing" << std::endl;
-			// connection.close();
 		}
 
 		public:
@@ -241,7 +233,6 @@ namespace rgw::amqp_1 {
 
 		void destroy(int s) {
 			status = s;
-			// close();
 
 			// fire all remaining callbacks, meeting
 			std::for_each(callbacks.begin(), callbacks.end(), [this](auto& cb_tag) {
@@ -303,10 +294,9 @@ namespace rgw::amqp_1 {
 		private:
 			std::atomic<size_t> connection_count;
 			bool stopped;
-			struct timeval read_timeout;
 			ConnectionList connections;
 			std::atomic<size_t> queued;
-			std::atomic<size_t> dequeued;
+			// std::atomic<size_t> dequeued;
 			CephContext* const cct;
 			mutable std::mutex connections_lock;
 			proton::container container;
@@ -371,7 +361,6 @@ namespace rgw::amqp_1 {
 					ldout(cct, 1) << "AMQP_1 connect: manager is stopped" << dendl;
 					return nullptr;
 				}
-				// TODO: check url format parse
 				// TODO: max connections check
 				std::lock_guard<std::mutex> lock(connections_lock);
 
@@ -422,6 +411,7 @@ namespace rgw::amqp_1 {
 			void connection_clean() {
 				for(auto& conn_it : connections) {
 					auto& conn = conn_it.second;
+					// if a newly created connection/sender is not ready yet, wait
 					while(!conn->ready);
 					conn->close();
 				}
@@ -431,10 +421,12 @@ namespace rgw::amqp_1 {
 				// if there's no connection, proton::container::run() will never stop
 				// dtor should wait for proton thread to safely quit
 				if(connections.empty()) {
+					// force the container thread to return imediately
 					container.stop();
 				} else {
+					// container.autostop() is enabled by default, so if there is no
+					// active connection, the container thread would return
 					connection_clean();
-					// container.stop();
 				}
 				container_runner.join();
 			}
