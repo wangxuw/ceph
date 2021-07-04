@@ -28,8 +28,7 @@ namespace rgw::amqp_1 {
 	void shutdown();
 
 	// TODO: the security configuration needs more params maybe
-	connection_ptr_t connect(const std::string& url, bool use_ssl,
-			boost::optional<const std::string&> ca_location);
+	connection_ptr_t connect(const std::string& url);
 
 	int publish(connection_ptr_t& conn, const std::string& topic, const
 			std::string& message);
@@ -58,9 +57,6 @@ namespace rgw::amqp_1 {
 
 	// number of maximum allowed inflight messages
 	size_t get_max_inflight();
-
-	// maximum number of messages in the queue
-	size_t get_max_queue();
 
 	// disconnect() is removed
 

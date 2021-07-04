@@ -11,7 +11,7 @@
 /*
 
 1. first build the amqp 1.0 broker, then run locally specifying a [address:port/topic]
-  e.g.  # ${BROKER_BINARY} -a localhost:5672/amqp1_0
+  e.g.  # amqp_1_broker -a localhost:5672/amqp1_0
 2. build this unit test and run it.
 
 */
@@ -51,7 +51,7 @@ TEST_F(TestAMQP_1, BuildOK) {
 TEST_F(TestAMQP_1, ConnectionOK) {
   const std::string test_broker = "localhost:5672/amqp1_0";
   const auto connection_number = rgw::amqp_1::get_connection_count();
-  auto conn = rgw::amqp_1::connect(test_broker, false, boost::none);
+  auto conn = rgw::amqp_1::connect(test_broker);
   EXPECT_TRUE(conn);
   const auto connection_number_plus = rgw::amqp_1::get_connection_count();
   EXPECT_EQ(connection_number_plus, connection_number + 1);
@@ -59,7 +59,7 @@ TEST_F(TestAMQP_1, ConnectionOK) {
 
 TEST_F(TestAMQP_1, PublishOK) {
   const std::string test_broker = "localhost:5672/amqp1_0";
-  auto conn = rgw::amqp_1::connect(test_broker, false, boost::none);
+  auto conn = rgw::amqp_1::connect(test_broker);
   EXPECT_TRUE(conn);
   auto rc = rgw::amqp_1::publish(conn, "amqp1_0", "new-sample-message");
   EXPECT_EQ(rc, 0);
@@ -67,11 +67,11 @@ TEST_F(TestAMQP_1, PublishOK) {
 
 TEST_F(TestAMQP_1, PublishWithCallback) {
   const std::string test_broker = "localhost:5672/amqp1_0";
-  auto conn = rgw::amqp_1::connect(test_broker, false, boost::none);
+  auto conn = rgw::amqp_1::connect(test_broker);
   EXPECT_TRUE(conn);
   auto rc = rgw::amqp_1::publish_with_confirm(conn, "amqp1_0", "sample-message", callback);
   EXPECT_EQ(rc, 0);
-  std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  std::this_thread::sleep_for(std::chrono::seconds(1));
   EXPECT_EQ(test_ok, true);
 }
 
