@@ -120,8 +120,6 @@ namespace rgw::amqp_1 {
 
   class connection_t : public proton::messaging_handler{
     public:
-    bool marked_for_deletion = false;
-    bool ready = false;
     int status;
     mutable std::atomic<int> ref_count = 0;
     CephContext* const cct;
@@ -152,7 +150,6 @@ namespace rgw::amqp_1 {
     void on_sender_open(proton::sender& s) override {
       sender = s;
       pwork_queue = &s.work_queue();
-      ready = true;
     }
 
     void on_sender_error(proton::sender& s) override {
@@ -188,7 +185,7 @@ namespace rgw::amqp_1 {
         // TODO: to print which tracker
         ldout(cct, 20) << "AMQP1.0, invoking callback of tracker" << dendl;
         it->cb(status_tracker_to_rgw(rc));
-        it = callbacks.erase(it);
+        callbacks.erase(it);
       } else {
         // callback not found
         ldout(cct, 1) << "AMQP1.0 tracker of unknown callback." << dendl;
@@ -209,11 +206,6 @@ namespace rgw::amqp_1 {
 
     void on_error(const proton::error_condition& e) override {
       ldout(cct, 1) << "AMQP1.0 proton error: " << e.what() << dendl;
-    }
-
-    // close the connection of the sender, called by the external thread (rgw)
-    void close() {
-      pwork_queue->add([this]() { connection.close(); });
     }
 
     public:
@@ -238,7 +230,7 @@ namespace rgw::amqp_1 {
     }
 
     bool is_ok() const {
-      return (status == RGW_AMQP_1_STATUS_OK && !marked_for_deletion);
+      return (status == RGW_AMQP_1_STATUS_OK);
     }
 
     friend void instrusive_ptr_add_ref(const connection_t* p);
@@ -258,8 +250,8 @@ namespace rgw::amqp_1 {
   }
 
   connection_ptr_t& create_connection(proton::container& container, connection_ptr_t& conn) {
-    // pointer must be valid and not marked for deletion
-    ceph_assert(conn && !conn->marked_for_deletion);
+    // pointer must be valid 
+    ceph_assert(conn);
 
     // reset all status code
     conn->status = RGW_AMQP_1_STATUS_OK;
@@ -285,7 +277,6 @@ namespace rgw::amqp_1 {
       const size_t max_inflight;
     private:
       std::atomic<size_t> connection_count;
-      bool stopped;
       ConnectionList connections;
       std::atomic<size_t> queued;
       std::atomic<size_t> dequeued;
@@ -310,7 +301,6 @@ namespace rgw::amqp_1 {
         max_connections(_max_connections),
         max_inflight(_max_inflight),
         connection_count(0),
-        stopped(false),
         connections(_max_connections),
         queued(0),
         dequeued(0),
@@ -332,18 +322,12 @@ namespace rgw::amqp_1 {
       Manager(const Manager&) = delete;
       const Manager& operator=(const Manager&) = delete;
 
-      // stop the main thread
-      void stop() {
-        stopped = true;
-      }
+      // stop() is removed.
 
       // disconnect() is removed.
 
       connection_ptr_t connect(const std::string& url) {
-        if(stopped) {
-          ldout(cct, 1) << "AMQP_1 connect: manager is stopped" << dendl;
-          return nullptr;
-        }
+
         // TODO: max connections check
         std::lock_guard<std::mutex> lock(connections_lock);
 
@@ -360,9 +344,6 @@ namespace rgw::amqp_1 {
 
       int publish(connection_ptr_t& conn, const std::string& topic, const
           std::string& message) {
-        if(stopped) {
-          return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
-        }
         if(!conn || !conn->is_ok()) {
           return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
         }
@@ -376,9 +357,6 @@ namespace rgw::amqp_1 {
 
       int publish_with_confirm(connection_ptr_t& conn, const std::string& topic,
           const std::string& message, reply_callback_t cb) {
-        if(stopped) {
-          return RGW_AMQP_1_STATUS_MANAGER_STOPPED;
-        }
         if(!conn || !conn->is_ok()) {
           return RGW_AMQP_1_STATUS_CONNECTION_CLOSED;
         }
