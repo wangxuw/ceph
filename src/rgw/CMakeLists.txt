@@ -162,6 +162,10 @@ endif()
 if(WITH_RADOSGW_KAFKA_ENDPOINT)
   list(APPEND librgw_common_srcs rgw_kafka.cc)
 endif()
+if(WITH_RADOSGW_AMQP_1_ENDPOINT)
+  list(APPEND librgw_common_srcs rgw_amqp_1.cc)
+endif()
+
 
 add_library(rgw_common OBJECT ${librgw_common_srcs})
 
@@ -276,6 +280,10 @@ endif()
 if(WITH_RADOSGW_KAFKA_ENDPOINT)
   # used by rgw_kafka.cc
   list(APPEND rgw_libs RDKafka::RDKafka)
+endif()
+if(WITH_RADOSGW_AMQP_1_ENDPOINT)
+  # used by rgw_amqp_1.cc
+  list(APPEND rgw_libs qpid-proton-cpp)
 endif()
 
 list(APPEND rgw_libs ${LUA_LIBRARIES})
