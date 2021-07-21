@@ -10,13 +10,11 @@
 #include <boost/smart_ptr/intrusive_ptr.hpp>
 #include <boost/optional.hpp>
 
-
 namespace rgw::amqp_1 {
 
 	struct connection_t;
 
 	typedef boost::intrusive_ptr<connection_t> connection_ptr_t;
-
 
 	void intrusive_ptr_add_ref(const connection_t* p);
 	void intrusive_ptr_release(const connection_t* p);
@@ -57,8 +55,6 @@ namespace rgw::amqp_1 {
 
 	// number of maximum allowed inflight messages
 	size_t get_max_inflight();
-
-	// disconnect() is removed
 
 	// display connection as string
 	std::string to_string(const connection_ptr_t& conn);

@@ -13,6 +13,7 @@
 #include <proton/container.hpp>
 #include <proton/connection.hpp>
 #include <proton/connection_options.hpp>
+#include <proton/reconnect_options.hpp>
 #include <proton/sender.hpp>
 #include <proton/work_queue.hpp>
 #include <proton/tracker.hpp>
@@ -59,7 +60,7 @@ namespace rgw::amqp_1 {
     reply_callback_with_tracker_t(proton::tracker _tracker, reply_callback_t
         _cb) : tracker(_tracker), cb(_cb) { }
 
-    bool operator==(proton::tracker rhs) const {
+    bool operator==(const proton::tracker& rhs) const {
       return tracker == rhs;
     }
   };
@@ -70,16 +71,15 @@ namespace rgw::amqp_1 {
     std::string message;
     reply_callback_t cb;
 
-    message_wrapper_t(connection_ptr_t& _conn,
+    message_wrapper_t(const connection_ptr_t& _conn,
       const std::string& _topic,
       const std::string& _message,
       reply_callback_t _cb) : conn(_conn), topic(_topic), message(_message), cb(_cb) { }
   };
 
-
-  typedef std::unordered_map<std::string, connection_ptr_t> ConnectionList;
-  typedef boost::lockfree::queue<message_wrapper_t*, boost::lockfree::fixed_sized<true>> MessageQueue;
-  typedef std::vector<reply_callback_with_tracker_t> CallbackList;
+  using ConnectionList =  std::unordered_map<std::string, connection_ptr_t>;
+  using MessageQueue =  boost::lockfree::queue<message_wrapper_t*, boost::lockfree::fixed_sized<true>>;
+  using CallbackList = std::vector<reply_callback_with_tracker_t>;
 
   // proton::tracker states to string
   std::string to_string(enum proton::transfer::state s) {
@@ -118,31 +118,34 @@ namespace rgw::amqp_1 {
     return AMQP_1_TRACKER_STATUS_UNKOWN;
   }
 
+  static const size_t MAX_QUEUE_DEFAULT = 1024;
+
   class connection_t : public proton::messaging_handler{
     public:
     int status;
     mutable std::atomic<int> ref_count = 0;
+    const size_t max_queue;
     CephContext* const cct;
     std::string broker;
     MessageQueue messages;
     CallbackList callbacks;
+    private:
     proton::connection connection;
     proton::sender sender;
     proton::work_queue* pwork_queue;
-    int queued;
 
-    public:
+    private:
 
-    void on_connection_open(proton::connection& conn) {
+    void on_connection_open(proton::connection& conn) override {
       connection = conn;
       ldout(cct, 10) << "AMQP 1.0 proton: connnection opened." << dendl;
     }
 
-    void on_connection_close(proton::connection& conn) {
+    void on_connection_close(proton::connection& conn) override {
       ldout(cct, 10) << "AMQP 1.0 proton: connection closed." << dendl;
     }
 
-    void on_connection_error(proton::connection& conn) {
+    void on_connection_error(proton::connection& conn) override {
       ldout(cct, 1) << "AMQP 1.0 proton: connection error:" << conn.error().what() << dendl;
     }
 
@@ -159,7 +162,6 @@ namespace rgw::amqp_1 {
     void on_sendable(proton::sender& s) override {
       auto count = messages.consume_all(std::bind(&connection_t::send, this,
         std::placeholders::_1));
-      queued -= count;
     }
 
     // send a message, and keep record the tracker for later callbacks
@@ -175,7 +177,6 @@ namespace rgw::amqp_1 {
     }
 
     // common callback for different tracker states
-    // TODO: multiple trackers problem
     void tracker_callback(proton::tracker& t) {
       // first find the corresponding tracker
       const auto rc = reply_to_code(t.state());
@@ -208,16 +209,6 @@ namespace rgw::amqp_1 {
       ldout(cct, 1) << "AMQP1.0 proton error: " << e.what() << dendl;
     }
 
-    public:
-
-    // default ctor
-    connection_t(CephContext* _cct, const std::string& _broker) : 
-      cct(_cct), broker(_broker), messages(1024) { }
-
-    ~connection_t() {
-      destroy(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
-    }
-
     void destroy(int s) {
       status = s;
 
@@ -229,6 +220,16 @@ namespace rgw::amqp_1 {
       callbacks.clear();
     }
 
+    public:
+
+    // default ctor
+    connection_t(CephContext* _cct, const std::string& _broker) : 
+      cct(_cct), broker(_broker), max_queue(MAX_QUEUE_DEFAULT), messages(max_queue) { }
+
+    ~connection_t() {
+      destroy(RGW_AMQP_1_STATUS_CONNECTION_CLOSED);
+    }
+
     bool is_ok() const {
       return (status == RGW_AMQP_1_STATUS_OK);
     }
@@ -237,6 +238,12 @@ namespace rgw::amqp_1 {
     friend void instrusive_ptr_release(const connection_t* p);
 
   };
+
+  std::string to_string(const connection_ptr_t& conn) {
+    std::string str;
+    str += "\nBroker: " + conn->broker;
+    return str;
+  }
 
   // these are required interfaces so that connection_t could be used inside
   // boost::intrusive_ptr
@@ -258,9 +265,9 @@ namespace rgw::amqp_1 {
 
     // TODO: ssl config
 
-    // open_sender() returns a returns<sender> type
+    // open_sender() returns a returns<sender> type, now we use the default reconnect options
     container.open_sender(conn->broker,
-      proton::connection_options().handler(*conn));
+      proton::connection_options().reconnect(proton::reconnect_options()).handler(*conn));
     return conn;
   }
 
@@ -289,11 +296,6 @@ namespace rgw::amqp_1 {
         container.run();
       }
 
-      // publish_internal() is for runner thread which used to handle amqp and
-      // kafka publishing, now in amqp 1.0 with the qpid proton library, we
-      // directly use the library-provided proton::container::run() thread, thus
-      // we don't need publish_internal() here.
-
     public:
       Manager(size_t _max_connections,
           size_t _max_inflight,
@@ -321,10 +323,6 @@ namespace rgw::amqp_1 {
       // non copyable
       Manager(const Manager&) = delete;
       const Manager& operator=(const Manager&) = delete;
-
-      // stop() is removed.
-
-      // disconnect() is removed.
 
       connection_ptr_t connect(const std::string& url) {
 
@@ -406,8 +404,6 @@ namespace rgw::amqp_1 {
 
   static const size_t MAX_CONNECTIONS_DEFAULT = 256;
   static const size_t MAX_INFLIGHT_DEFAULT = 8192; 
-  static const size_t MAX_QUEUE_DEFAULT = 8192;
-  static const long READ_TIMEOUT_USEC = 100;
 
   bool init(CephContext* cct) {
     if (s_manager) {
@@ -473,6 +469,4 @@ namespace rgw::amqp_1 {
     return s_manager->max_inflight;
   }
 
-  // disconnect() is removed.
-
-  } // namespace amqp_1
+} // namespace amqp_1
